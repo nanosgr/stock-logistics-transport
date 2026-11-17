@@ -1,7 +1,13 @@
 # Copyright (C) 2018 - TODAY, Open Source Integrators
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
+import json
+import re
+
+from lxml import etree
+
 from odoo import api, fields, models
+from odoo.tools.safe_eval import safe_eval
 
 DRIVER_LICENSE_TYPES = [
     ("A", "A - Motorcycles"),
@@ -89,30 +95,101 @@ class TmsDriver(models.Model):
             return stage.id
 
     # Inherited actions from res_partner
+    #
+    # The driver form inherits ``base.view_partner_form``, so every button that
+    # other modules add to the partner form (sales, purchases, opportunities,
+    # invoices, employees, ...) ends up on this view. Those buttons expect a
+    # ``res.partner`` record, so they are rewritten to run on ``partner_id``.
+
+    @api.model
+    def _get_view(self, view_id=None, view_type="form", **options):
+        arch, view = super()._get_view(view_id, view_type, **options)
+        if view_type == "form":
+            self._delegate_partner_buttons(arch)
+        return arch, view
+
+    @api.model
+    def _delegate_partner_buttons(self, arch):
+        partner_model = self.env["res.partner"]
+        delegated = False
+        for node in arch.iter("button"):
+            btype, name = node.get("type"), node.get("name")
+            if not name or node.get("special"):
+                continue
+            if btype == "object":
+                if name == "action_tms_partner_button" or not hasattr(
+                    partner_model, name
+                ):
+                    continue
+            elif btype != "action":
+                continue
+            node.set("args", json.dumps([btype, name]))
+            node.set("name", "action_tms_partner_button")
+            node.set("type", "object")
+            context = node.get("context")
+            if context:
+                # ``id`` is the driver id here, the partner one is ``partner_id``
+                node.set("context", re.sub(r"(?<![\w.'\"])id\b", "partner_id", context))
+            delegated = True
+        if delegated and not arch.xpath("//field[@name='partner_id']"):
+            target = (arch.xpath("//sheet") or [arch])[0]
+            target.append(
+                etree.Element("field", name="partner_id", invisible="1")
+            )
+
+    def action_tms_partner_button(self, button_type, name):
+        self.ensure_one()
+        partner = self.partner_id
+        if button_type == "object":
+            return getattr(partner, name)()
+        action = self._tms_partner_action(name, partner)
+        return action
+
+    @api.model
+    def _tms_partner_action(self, name, partner):
+        if str(name).isdigit():
+            action = self.env["ir.actions.actions"].sudo().browse(int(name))
+        else:
+            action = self.env.ref(name)
+        action = self.env[action.type].browse(action.id)._get_action_dict()
+        eval_context = dict(
+            self.env["ir.actions.actions"]._get_eval_context(),
+            context=dict(self.env.context),
+            active_id=partner.id,
+            active_ids=partner.ids,
+            active_model=partner._name,
+            allowed_company_ids=self.env.companies.ids,
+            context_today=lambda: fields.Date.context_today(self),
+        )
+        for key, default in (("context", {}), ("domain", [])):
+            value = action.get(key)
+            if isinstance(value, str):
+                action[key] = safe_eval(value, eval_context) if value else default
+        action["context"] = dict(
+            action.get("context") or {},
+            active_id=partner.id,
+            active_ids=partner.ids,
+            active_model=partner._name,
+        )
+        return action
 
     def create_company(self):
-        res = super().create_company()
-        return res
+        return self.partner_id.create_company()
 
     def action_open_employees(self):
-        res = super().action_open_employees()
-        return res
+        return self.partner_id.action_open_employees()
 
     def open_commercial_entity(self):
-        res = super().open_commercial_entity()
-        return res
+        return self.partner_id.open_commercial_entity()
 
     def phone_action_blacklist_remove(self):
-        res = super().phone_action_blacklist_remove()
-        return res
+        return self.partner_id.phone_action_blacklist_remove()
 
     def mail_action_blacklist_remove(self):
-        res = super().mail_action_blacklist_remove()
-        return res
+        return self.partner_id.mail_action_blacklist_remove()
 
     def geo_localize(self):
-        res = super().geo_localize()
-        return res
+        return self.partner_id.geo_localize()
 
     def schedule_meeting(self):
         return self.partner_id.schedule_meeting()
